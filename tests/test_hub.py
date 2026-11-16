@@ -311,7 +311,8 @@ class TestWaveshareRelayHub:
     @pytest.mark.asyncio
     async def test_restore_last_states_enabled(self, hub):
         """Test restoring last states when enabled."""
-        # Set up some saved states
+        # The board came back all-off (it lost power); saved states say relay 1 was on
+        hub._startup_states = [False] * 32
         hub._relay_states[0] = True   # Relay 1
         hub._relay_states[2] = False  # Relay 3
         
@@ -342,9 +343,82 @@ class TestWaveshareRelayHub:
         with patch.object(hub, '_load_last_states', new_callable=AsyncMock) as mock_load:
             with patch.object(hub, '_send_relay_states', new_callable=AsyncMock) as mock_send:
                 # Set all states to False
+                hub._startup_states = [False] * 32
                 hub._relay_states = [False] * 32
                 
                 await hub.restore_last_states()
                 
                 mock_load.assert_called_once()
                 mock_send.assert_not_called()  # No states to restore 
+
+    def test_state_file_is_per_board(self, sample_config, mock_hass):
+        """Boards sharing one gateway (same host:port) must not share a state file."""
+        hub_a = WaveshareRelayHub({**sample_config, "device_address": 101}, mock_hass)
+        hub_b = WaveshareRelayHub({**sample_config, "device_address": 102}, mock_hass)
+
+        assert hub_a._state_file != hub_b._state_file
+        assert hub_a._state_file.name.endswith("_101.json")
+
+    @pytest.mark.asyncio
+    async def test_restore_skipped_when_board_kept_power(self, hub):
+        """Only HA restarted: the board still has relays on, so its live state wins."""
+        hub._startup_states = [False] * 32
+        hub._startup_states[2] = True  # relay 3 (configured) is on
+
+        with patch.object(hub, '_load_last_states', new_callable=AsyncMock) as mock_load, \
+                patch.object(hub, '_send_relay_states', new_callable=AsyncMock) as mock_send, \
+                patch.object(hub, '_save_last_states', new_callable=AsyncMock) as mock_save:
+            await hub.restore_last_states()
+
+        mock_load.assert_not_called()
+        mock_send.assert_not_called()
+        mock_save.assert_called_once()  # resync the file with the board
+
+    @pytest.mark.asyncio
+    async def test_restore_ignores_unconfigured_relays_that_are_on(self, hub):
+        """An unconfigured relay being on does not count as 'board kept power'."""
+        hub._startup_states = [False] * 32
+        hub._startup_states[9] = True  # relay 10 is not configured
+
+        with patch.object(hub, '_load_last_states', new_callable=AsyncMock) as mock_load, \
+                patch.object(hub, '_send_relay_states', new_callable=AsyncMock):
+            await hub.restore_last_states()
+
+        mock_load.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restore_skipped_when_board_did_not_answer(self, hub):
+        """No startup read means nothing is known, so nothing is written to the board."""
+        hub._startup_states = None
+
+        with patch.object(hub, '_load_last_states', new_callable=AsyncMock) as mock_load, \
+                patch.object(hub, '_send_relay_states', new_callable=AsyncMock) as mock_send:
+            await hub.restore_last_states()
+
+        mock_load.assert_not_called()
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_read_saves_states_when_they_change(self, hub):
+        """Polling keeps the state file in step with the board."""
+        hub._startup_states = [False] * 32
+        response = bytes([0x01, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00])  # relay 1 on (byte order is reversed)
+
+        with patch.object(hub, 'send_command', new_callable=AsyncMock, return_value=response), \
+                patch.object(hub, '_save_last_states', new_callable=AsyncMock) as mock_save:
+            await hub.read_relay_status()
+            await hub.read_relay_status()  # unchanged: no second save
+
+        assert hub._relay_states[0] is True
+        mock_save.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_read_does_not_save_before_startup(self, hub):
+        """The first read (inside create) must not overwrite the saved file before restore."""
+        response = bytes([0x01, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00])
+
+        with patch.object(hub, 'send_command', new_callable=AsyncMock, return_value=response), \
+                patch.object(hub, '_save_last_states', new_callable=AsyncMock) as mock_save:
+            await hub.read_relay_status()
+
+        mock_save.assert_not_called()

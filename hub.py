@@ -163,6 +163,8 @@ class WaveshareRelayHub:
         # Get the total number of relays from the device
         self._num_relays = config.get("num_relays", 32)  # Default to 32 if not specified
         self._relay_states = [False] * self._num_relays
+        # What the board reported at startup; None until (or unless) that first read succeeds.
+        self._startup_states = None
         self._lock = asyncio.Lock()
         self._byte_size = (self._num_relays + 7) // 8
         
@@ -176,7 +178,8 @@ class WaveshareRelayHub:
         self._restore_state = config.get(CONF_RESTORE_STATE, DEFAULT_RESTORE_STATE)
         self._state_file = None
         if self._hass and self._restore_state:
-            self._state_file = Path(self._hass.config.config_dir) / f"{DOMAIN}_{self._host}_{self._port}.json"
+            # One file per board: several boards can share one RS485 gateway (same host:port).
+            self._state_file = Path(self._hass.config.config_dir) / f"{DOMAIN}_{self._host}_{self._port}_{self._device_address}.json"
         
         # Track which relays are actually configured
         self._configured_relays = self._get_configured_relays(config)
@@ -217,6 +220,7 @@ class WaveshareRelayHub:
         """Alternative constructor to ensure initialization finishes before returning."""
         self = cls(config, hass)
         result = await self.read_relay_status()
+        self._startup_states = list(result) if result is not None else None
         # Update last successful communication time after successful initial read
         if result is not None:
             self._last_successful_communication = time.time()
@@ -228,46 +232,52 @@ class WaveshareRelayHub:
         return self
 
     async def _load_last_states(self):
-        """Load last known states from file."""
-        if not self._state_file or not self._state_file.exists():
-            _LOGGER.debug("No last state file found, using default states")
-            return
-            
-        try:
-            with open(self._state_file, 'r') as f:
-                saved_states = json.load(f)
-                _LOGGER.debug("Loaded last states: %s", saved_states)
-                
-                # Apply saved states to configured relays only
-                for relay_num, state in saved_states.items():
-                    relay_num = int(relay_num)
-                    if relay_num in self._configured_relays and 1 <= relay_num <= self._num_relays:
-                        self._relay_states[relay_num - 1] = state
-                        _LOGGER.debug("Restored relay %s to state: %s", relay_num, state)
-                        
-        except (json.JSONDecodeError, IOError) as e:
-            _LOGGER.warning("Failed to load last states: %s", e)
-
-    async def _save_last_states(self):
-        """Save current states to file."""
+        """Load last known states from file (file I/O runs off the event loop)."""
         if not self._state_file:
             return
-            
+
+        def _read():
+            if not self._state_file.exists():
+                return None
+            with open(self._state_file, 'r') as f:
+                return json.load(f)
+
         try:
-            # Create directory if it doesn't exist
+            saved_states = await asyncio.get_running_loop().run_in_executor(None, _read)
+        except (json.JSONDecodeError, IOError) as e:
+            _LOGGER.warning("Failed to load last states: %s", e)
+            return
+        if saved_states is None:
+            _LOGGER.debug("No last state file found, using default states")
+            return
+
+        _LOGGER.debug("Loaded last states: %s", saved_states)
+        # Apply saved states to configured relays only
+        for relay_num, state in saved_states.items():
+            relay_num = int(relay_num)
+            if relay_num in self._configured_relays and 1 <= relay_num <= self._num_relays:
+                self._relay_states[relay_num - 1] = state
+
+    async def _save_last_states(self):
+        """Save current states to file (file I/O runs off the event loop)."""
+        if not self._state_file:
+            return
+
+        # Save only configured relay states
+        states_to_save = {
+            str(n): self._relay_states[n - 1]
+            for n in self._configured_relays
+            if 1 <= n <= self._num_relays
+        }
+
+        def _write():
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Save only configured relay states
-            states_to_save = {}
-            for relay_num in self._configured_relays:
-                if 1 <= relay_num <= self._num_relays:
-                    states_to_save[str(relay_num)] = self._relay_states[relay_num - 1]
-            
             with open(self._state_file, 'w') as f:
                 json.dump(states_to_save, f)
-                
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _write)
             _LOGGER.debug("Saved last states: %s", states_to_save)
-            
         except IOError as e:
             _LOGGER.error("Failed to save last states: %s", e)
 
@@ -307,6 +317,16 @@ class WaveshareRelayHub:
             _LOGGER.debug("State restoration disabled")
             return
             
+        startup = self._startup_states
+        if startup is None:
+            _LOGGER.warning("Not restoring relay states: the board did not answer at startup")
+            return
+        if any(startup[n - 1] for n in self._configured_relays if 1 <= n <= self._num_relays):
+            # The board kept power (only HA restarted): its live state is the truth.
+            _LOGGER.info("Board kept its relay states; not restoring")
+            await self._save_last_states()
+            return
+
         await self._load_last_states()
         
         # Check if we have any saved states to restore
@@ -453,7 +473,11 @@ class WaveshareRelayHub:
         full_binary = ''.join(f"{byte:08b}" for byte in status_bytes)[::-1]
 
         # Convert binary string into relay status list
-        self._relay_states = [bit == "1" for bit in full_binary[:self._num_relays]]
+        new_states = [bit == "1" for bit in full_binary[:self._num_relays]]
+        changed = new_states != self._relay_states
+        self._relay_states = new_states
+        if changed and self._startup_states is not None:
+            await self._save_last_states()
         
         _LOGGER.debug(
             "Read relay status: %s",

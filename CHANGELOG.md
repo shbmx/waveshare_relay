@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-11-16
+
+### Fixed
+- Restarting Home Assistant no longer switches relays off. Boards that share one RS485 gateway
+  (same host and port) also shared one state file, so at startup each board was sent another
+  board's saved states. The state file is now per board: `waveshare_relay_<host>_<port>_<device_address>.json`.
+- Saved states are only restored when the board comes back with every configured relay off
+  (it lost power). If the board kept power, its live state is kept. If it does not answer at
+  startup, nothing is written to it.
+- The state file now follows the board's polled state, so it is never stale.
+- State file reads and writes run off the event loop (no more "blocking call to open" warning).
+
+Existing `waveshare_relay_<host>_<port>.json` files are no longer read and can be deleted.
+
 ## [2.1.0] - 2025-01-XX
 
 ### 🔧 Fixed - Entity Lifecycle & State Persistence
